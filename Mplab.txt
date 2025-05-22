@@ -1,0 +1,261 @@
+#include <xc.h>
+#include "I2C_LCD.h"
+#include <stdio.h>
+#include <string.h>
+
+// CONFIG
+#pragma config FOSC = HS
+#pragma config WDTE = OFF
+#pragma config PWRTE = OFF
+#pragma config BOREN = ON
+#pragma config LVP = OFF
+#pragma config CPD = OFF
+#pragma config WRT = OFF
+#pragma config CP = OFF
+#pragma config MCLRE = ON
+
+#define _XTAL_FREQ 20000000
+
+// Button remapped to RD4-RD7
+#define BTN_AUTO      PORTDbits.RD4
+#define BTN_MANUAL    PORTDbits.RD5
+#define BTN_MANUAL_F  PORTDbits.RD6
+#define BTN_MANUAL_R  PORTDbits.RD7
+
+#define MOTOR_FWD     PORTBbits.RB0
+#define MOTOR_REV     PORTBbits.RB1
+
+unsigned int thresholdRain = 500;
+unsigned int thresholdLight = 500;
+
+unsigned char isAutoMode = 1;
+
+// ADC Init
+void ADC_Init() {
+    ADCON1 = 0b10001110; // AN0, AN1 analog, rest digital
+    TRISA |= 0x03;       // RA0, RA1 input
+    ADCON0 = 0b00000001; // ADC enable, channel 0
+    __delay_ms(2);
+}
+
+// Read ADC
+unsigned int ADC_Read(unsigned char channel) {
+    ADCON0bits.CHS = channel;
+    __delay_us(20);
+    ADCON0bits.ADON = 1;
+    __delay_us(10);
+    ADCON0bits.GO_nDONE = 1;
+    while (ADCON0bits.GO_nDONE);
+    return ((unsigned int)(ADRESH << 8) | ADRESL);
+}
+
+// UART Init
+void UART_Init() {
+    TRISCbits.TRISC6 = 0;
+    TRISCbits.TRISC7 = 1;
+    SPBRG = 132;         // 9600 baud for 20MHz, BRGH=1
+    TXSTAbits.BRGH = 1;
+    TXSTAbits.SYNC = 0;
+    RCSTAbits.SPEN = 1;
+    TXSTAbits.TXEN = 1;
+    RCSTAbits.CREN = 1;
+}
+
+void UART_SendChar(char data) {
+    while (!PIR1bits.TXIF);
+    TXREG = data;
+}
+
+void UART_SendString(const char *s) {
+    while (*s) UART_SendChar(*s++);
+}
+
+// Get motor state as string
+const char* Get_Motor_State() {
+    if (MOTOR_FWD == 1 && MOTOR_REV == 0) return "FWD";
+    else if (MOTOR_FWD == 0 && MOTOR_REV == 1) return "REV";
+    else return "STOP";
+}
+
+// Run motor: direction=1 (forward), 0 (reverse)
+void Motor_Run(unsigned char direction) {
+    if (direction) {
+        MOTOR_FWD = 1;
+        MOTOR_REV = 0;
+//        LCD_Set_Cursor(2, 12);
+//        LCD_Write_String("      ");
+//        LCD_Set_Cursor(2, 12);
+//        LCD_Write_String("FWD");
+    } else {
+        MOTOR_FWD = 0;
+        MOTOR_REV = 1;
+//        LCD_Set_Cursor(2, 12);
+//        LCD_Write_String("      ");
+//        LCD_Set_Cursor(2, 12);
+//        LCD_Write_String("REV");
+    }
+    __delay_ms(5000);
+    MOTOR_FWD = 0;
+    MOTOR_REV = 0;
+//    LCD_Set_Cursor(2, 12);
+//    LCD_Write_String("      ");
+//    LCD_Set_Cursor(2, 12);
+//    LCD_Write_String("STOP");
+}
+
+// Display AUTO/MANUAL mode
+void Display_Mode(unsigned char isAuto) {
+    LCD_Clear();
+    LCD_Set_Cursor(1, 1);
+    LCD_Write_String(isAuto ? "Mode: AUTO" : "Mode: MANUAL");
+    __delay_ms(2000);
+    LCD_Clear();
+}
+
+// Display sensor values, thresholds, and motor state
+void Display_Sensor(unsigned int lightVal, unsigned int rainVal) {
+    char line[17];
+    LCD_Clear();
+    LCD_Set_Cursor(1, 1);
+    sprintf(line, "L:%u R:%u", lightVal, rainVal);
+    LCD_Write_String(line);
+    LCD_Set_Cursor(2, 1);
+    sprintf(line, "T:%u/%u %s", thresholdRain, thresholdLight, Get_Motor_State());
+    LCD_Write_String(line);
+}
+
+// Software debounce for buttons
+unsigned char Button_Debounce(unsigned char bitValue) {
+    if (bitValue == 0) {
+        __delay_ms(20);
+        if (bitValue == 0) return 1;
+    }
+    return 0;
+}
+
+// Handle AUTO button with debounce
+void Handle_Auto_Button() {
+    static unsigned char prevAutoState = 1;
+    unsigned char currentState = BTN_AUTO;
+
+    if (prevAutoState == 1 && Button_Debounce(BTN_AUTO)){
+        isAutoMode = 1;
+        Display_Mode(isAutoMode);
+    }
+    prevAutoState = currentState;
+}
+
+// Handle MANUAL button with debounce
+void Handle_Manual_Button() {
+    static unsigned char prevManualState = 1;
+    unsigned char currentState = BTN_MANUAL;
+
+    if (prevManualState == 1 && Button_Debounce(BTN_MANUAL)){
+        isAutoMode = 0;
+        Display_Mode(isAutoMode);
+    }
+    prevManualState = currentState;
+}
+
+// Send thresholds via UART
+void Send_Thresholds() {
+    char buffer[32];
+    sprintf(buffer, "THR=%u;THL=%u\r\n", thresholdRain, thresholdLight);
+    UART_SendString(buffer);
+}
+
+char UART_ReadChar(void) {
+    while (!PIR1bits.RCIF); // ch? ??n khi có d? li?u
+    return RCREG;
+}
+
+void main() {
+    unsigned int rainVal, lightVal;
+    char uartBuffer[64];
+    char uartInput[32];
+    unsigned char uartIdx = 0;
+    char line[17];
+    
+    TRISD = 0xFF;                  // PORTD all input
+    TRISB &= 0b11111100;           // RB0, RB1 output
+    PORTB = 0x00;
+
+    UART_Init();
+    ADC_Init();
+    I2C_Master_Init(100000);
+    LCD_Init();
+    __delay_ms(200);
+
+    LCD_Clear();
+    LCD_Set_Cursor(1, 1);
+    LCD_Write_String("Init OK");
+    __delay_ms(1000);
+    LCD_Clear();
+
+    while (1) {
+        rainVal = ADC_Read(1);
+        lightVal = ADC_Read(0);
+
+        Handle_Auto_Button();
+        Handle_Manual_Button();
+
+        Display_Sensor(lightVal, rainVal);
+
+        if (isAutoMode) {
+            if (rainVal > thresholdRain || lightVal > thresholdLight) {
+                Motor_Run(1);
+            }
+        } else {
+            if (!Button_Debounce(BTN_MANUAL_F)) Motor_Run(1);
+            if (!Button_Debounce(BTN_MANUAL_R)) Motor_Run(0);
+        }
+
+        sprintf(uartBuffer, "Mode:%s,R:%u,L:%u,THR:%u,THL:%u,Motor:%s\r\n",
+                isAutoMode ? "AUTO" : "MANUAL", rainVal, lightVal, thresholdRain, thresholdLight, Get_Motor_State());
+        UART_SendString(uartBuffer);
+
+        // Handle UART commands
+        if (PIR1bits.RCIF) {
+            char c = UART_ReadChar();
+            if (c == '\n' || c == '\r') {
+                uartInput[uartIdx] = '\0';
+                // Parse UART commands
+                if (strncmp(uartInput, "THR=", 4) == 0) {
+                    sscanf(uartInput, "THR=%u", &thresholdRain);
+                    LCD_Clear();
+                    LCD_Set_Cursor(1, 1);
+                    sprintf(line, "Rain: %u", thresholdRain);
+                    LCD_Write_String(line);
+                    __delay_ms(1000);
+                    Send_Thresholds();
+                } else if (strncmp(uartInput, "THL=", 4) == 0) {
+                    sscanf(uartInput, "THL=%u", &thresholdLight);
+                    LCD_Set_Cursor(2, 1);
+                    sprintf(line, "Light: %u", thresholdLight);
+                    LCD_Write_String(line);
+                    __delay_ms(1000);
+                    Send_Thresholds();
+                } else if (strcmp(uartInput, "FWD") == 0 && !isAutoMode) {
+                    Motor_Run(1);
+                    Send_Thresholds();
+                } else if (strcmp(uartInput, "REV") == 0 && !isAutoMode) {
+                    Motor_Run(0);
+                    Send_Thresholds();
+                } else if (strcmp(uartInput, "MODE=AUTO") == 0) {
+                    isAutoMode = 1;
+                    Display_Mode(isAutoMode);
+                    Send_Thresholds();  
+                } else if (strcmp(uartInput, "MODE=MANUAL") == 0) {
+                    isAutoMode = 0;
+                    Display_Mode(isAutoMode);
+                    Send_Thresholds();
+                }
+                uartIdx = 0;
+            } else {
+                if (uartIdx < sizeof(uartInput) - 1)
+                    uartInput[uartIdx++] = c;
+            }
+        }
+        __delay_ms(50);
+    }
+}
