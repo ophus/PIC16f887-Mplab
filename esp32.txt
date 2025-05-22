@@ -1,0 +1,348 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HardwareSerial.h>
+#include <WiFiManager.h>
+
+// Hardware Serial for PIC communication
+HardwareSerial PICSerial(1); 
+WebServer server(80);
+
+// System parameters
+int threshold1 = 500;  // Rain threshold
+int threshold2 = 500;  // Light threshold
+
+// Received values from PIC
+int receivedThreshold1 = 500;
+int receivedThreshold2 = 500;
+int sensorRain = 0;
+int sensorLight = 0;
+String mode = "AUTO";
+String motorStatus = "STOP";
+
+// Timing variables
+unsigned long lastCommandTime = 0;
+unsigned long lastDataSendTime = 0;
+const unsigned long commandInterval = 2000; // Send commands every 2 seconds
+const unsigned long dataSendInterval = 500;  // Send data every 500ms
+bool pendingThresholdUpdate = false;
+bool waitingForResponse = false;
+
+// HTML Page
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta charset='UTF-8'>";
+  html += "<title>Mái che tự động</title>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 0; background-color: #f4f4f4; }";
+  html += "header { background: #0066cc; color: #fff; text-align: center; padding: 15px; }";
+  html += "h1 { margin: 0; font-size: 1.8em; }";
+  html += ".container { max-width: 800px; margin: 20px auto; padding: 20px; background: #fff; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }";
+  html += ".status-section { text-align: center; margin-bottom: 20px; }";
+  html += ".status-section .mode { font-size: 1.2em; font-weight: bold; color: #0066cc; }";
+  html += ".sensor-container { display: flex; justify-content: space-between; margin-bottom: 20px; }";
+  html += ".sensor-box { width: 48%; padding: 15px; background: #f9f9f9; border-radius: 6px; }";
+  html += ".sensor-box h3 { color: #0066cc; margin-top: 0; }";
+  html += "label { display: block; margin: 10px 0 5px; font-weight: bold; }";
+  html += "input[type='number'], select { padding: 8px; width: 100%; max-width: 150px; border: 1px solid #ccc; border-radius: 4px; }";
+  html += "input[type='submit'], button { padding: 8px 16px; background: #0066cc; color: #fff; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }";
+  html += "input[type='submit']:hover, button:hover { background: #0055aa; }";
+  html += ".sensor-data, .status { margin: 10px 0; font-size: 1.1em; color: #444; }";
+  html += ".sensor-data span { font-weight: bold; color: #0066cc; }";
+  html += ".motor-section { text-align: center; padding: 15px; background: #f9f9f9; border-radius: 6px; }";
+  html += ".connection-status { text-align: center; padding: 10px; margin-bottom: 20px; border-radius: 6px; }";
+  html += ".connected { background: #d4edda; color: #155724; }";
+  html += ".disconnected { background: #f8d7da; color: #721c24; }";
+  html += "@media (max-width: 600px) { .sensor-container { flex-direction: column; } .sensor-box { width: 100%; margin-bottom: 15px; } }";
+  html += "</style>";
+  html += "<script>";
+  html += "function updateSensorData() {";
+  html += "  fetch('/data').then(response => response.json()).then(data => {";
+  html += "    document.querySelector('.mode').textContent = 'Chế độ: ' + data.mode;";
+  html += "    document.querySelector('#light-value').textContent = data.sensorLight;";
+  html += "    document.querySelector('#rain-value').textContent = data.sensorRain;";
+  html += "    document.querySelector('#threshold-light').textContent = data.receivedThreshold2;";
+  html += "    document.querySelector('#threshold-rain').textContent = data.receivedThreshold1;";
+  html += "    document.querySelector('#motor-status').textContent = data.motorStatus;";
+  html += "    document.querySelector('#connection-status').textContent = data.connectionStatus;";
+  html += "    document.querySelector('#connection-status').className = 'connection-status ' + (data.connectionStatus === 'Đã kết nối' ? 'connected' : 'disconnected');";
+  html += "  }).catch(error => console.error('Error fetching data:', error));";
+  html += "}";
+  html += "setInterval(updateSensorData, 1000);";
+  html += "updateSensorData();";
+  html += "</script>";
+  html += "</head><body>";
+  html += "<header><h1>Mái che tự động</h1></header>";
+  html += "<div class='container'>";
+
+  // Connection Status
+  html += "<div id='connection-status' class='connection-status'>Kiểm tra kết nối...</div>";
+
+  // System Status
+  html += "<div class='status-section'>";
+  html += "<div class='mode'>Chế độ: " + mode + "</div>";
+  html += "<form action='/setMode'>";
+  html += "<label for='mode'>Chọn chế độ:</label>";
+  html += "<select id='mode' name='mode'>";
+  html += "<option value='AUTO'" + String(mode == "AUTO" ? " selected" : "") + ">AUTO</option>";
+  html += "<option value='MANUAL'" + String(mode == "MANUAL" ? " selected" : "") + ">MANUAL</option>";
+  html += "</select>";
+  html += "<input type='submit' value='Chuyển'>";
+  html += "</form>";
+  html += "</div>";
+
+  // Sensors
+  html += "<div class='sensor-container'>";
+  // Light Sensor
+  html += "<div class='sensor-box'>";
+  html += "<h3>Cảm biến ánh sáng</h3>";
+  html += "<div class='sensor-data'>Giá trị: <span id='light-value'>" + String(sensorLight) + "</span></div>";
+  html += "<div class='status'>Ngưỡng: <span id='threshold-light'>" + String(receivedThreshold2) + "</span></div>";
+  html += "<form action='/set2'>";
+  html += "<label for='t2'>Đặt ngưỡng:</label>";
+  html += "<input type='number' id='t2' name='t2' value='" + String(threshold2) + "' min='0' max='1000'>";
+  html += "<input type='submit' value='Cập nhật'>";
+  html += "</form>";
+  html += "</div>";
+
+  // Rain Sensor
+  html += "<div class='sensor-box'>";
+  html += "<h3>Cảm biến mưa</h3>";
+  html += "<div class='sensor-data'>Giá trị: <span id='rain-value'>" + String(sensorRain) + "</span></div>";
+  html += "<div class='status'>Ngưỡng: <span id='threshold-rain'>" + String(receivedThreshold1) + "</span></div>";
+  html += "<form action='/set1'>";
+  html += "<label for='t1'>Đặt ngưỡng:</label>";
+  html += "<input type='number' id='t1' name='t1' value='" + String(threshold1) + "' min='0' max='1000'>";
+  html += "<input type='submit' value='Cập nhật'>";
+  html += "</form>";
+  html += "</div>";
+  html += "</div>";
+
+  // Motor Control
+  html += "<div class='motor-section'>";
+  html += "<h3>Điều khiển động cơ</h3>";
+  html += "<div class='status'>Trạng thái: <span id='motor-status'>" + motorStatus + "</span></div>";
+  if (mode == "MANUAL") {
+    html += "<form action='/controlMotor'>";
+    html += "<button type='submit' name='motor' value='FORWARD'>Tới</button>";
+    html += "<button type='submit' name='motor' value='BACKWARD'>Lui</button>";
+    html += "<button type='submit' name='motor' value='STOP'>Dừng</button>";
+    html += "</form>";
+  } else {
+    html += "<p>Chế độ AUTO - Động cơ tự động điều khiển</p>";
+  }
+  html += "</div>";
+
+  html += "</div></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// Send command to PIC with retry mechanism
+void sendCommandToPIC(String command) {
+  for (int i = 0; i < 3; i++) {  // Retry 3 times
+    PICSerial.print(command + "\r\n");
+    Serial.println("Gửi lệnh đến PIC: " + command);
+    delay(100);  // Wait between retries
+  }
+}
+
+// Send thresholds to PIC
+void sendThresholdToPIC() {
+  sendCommandToPIC("THR=" + String(threshold1));
+  delay(200);
+  sendCommandToPIC("THL=" + String(threshold2));
+  Serial.println("Đã gửi ngưỡng: THR=" + String(threshold1) + ", THL=" + String(threshold2));
+  pendingThresholdUpdate = false;
+}
+
+// Handle rain threshold update
+void handleSet1() {
+  if (server.hasArg("t1")) {
+    threshold1 = server.arg("t1").toInt();
+    sendCommandToPIC("THR=" + String(threshold1));
+    Serial.println("Cập nhật ngưỡng mưa: " + String(threshold1));
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// Handle light threshold update
+void handleSet2() {
+  if (server.hasArg("t2")) {
+    threshold2 = server.arg("t2").toInt();
+    sendCommandToPIC("THL=" + String(threshold2));
+    Serial.println("Cập nhật ngưỡng ánh sáng: " + String(threshold2));
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// Handle mode change
+void handleSetMode() {
+  if (server.hasArg("mode")) {
+    String newMode = server.arg("mode");
+    sendCommandToPIC("MODE=" + newMode);
+    mode = newMode;
+    Serial.println("Đã gửi chế độ: MODE=" + newMode);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// Handle motor control
+void handleControlMotor() {
+  if (server.hasArg("motor") && mode == "MANUAL") {
+    String motorCommand = server.arg("motor");
+    
+    if (motorCommand == "FORWARD") {
+      sendCommandToPIC("FWD");
+      motorStatus = "FWD";
+    } else if (motorCommand == "BACKWARD") {
+      sendCommandToPIC("REV");
+      motorStatus = "REV";
+    } else if (motorCommand == "STOP") {
+      sendCommandToPIC("STOP");
+      motorStatus = "STOP";
+    }
+    Serial.println("Đã gửi lệnh động cơ: " + motorCommand);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// Send JSON data
+void handleData() {
+  String connectionStatus = (millis() - lastDataSendTime < 5000) ? "Đã kết nối" : "Mất kết nối";
+  
+  String json = "{";
+  json += "\"mode\":\"" + mode + "\",";
+  json += "\"sensorLight\":" + String(sensorLight) + ",";
+  json += "\"sensorRain\":" + String(sensorRain) + ",";
+  json += "\"receivedThreshold1\":" + String(receivedThreshold1) + ",";
+  json += "\"receivedThreshold2\":" + String(receivedThreshold2) + ",";
+  json += "\"motorStatus\":\"" + motorStatus + "\",";
+  json += "\"connectionStatus\":\"" + connectionStatus + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// Setup function
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize WiFiManager
+  WiFiManager wm;
+  bool res = wm.autoConnect("ESP32_Embed", "12345678");
+  
+  if (!res) {
+    Serial.println("Kết nối thất bại hoặc timeout");
+    ESP.restart();
+  } else {
+    Serial.println("Đã kết nối WiFi!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  }
+
+  // Initialize web server
+  server.on("/", handleRoot);
+  server.on("/set1", handleSet1);
+  server.on("/set2", handleSet2);
+  server.on("/data", handleData);
+  server.on("/setMode", handleSetMode);
+  server.on("/controlMotor", handleControlMotor);
+  server.begin();
+
+  // Initialize serial communication with PIC
+  PICSerial.begin(9600, SERIAL_8N1, 16, 17); // RX=GPIO16, TX=GPIO17
+  Serial.println("PICSerial initialized on RX=GPIO16, TX=GPIO17");
+  
+  // Send initial configuration
+  delay(2000);  // Wait for PIC to initialize
+  sendThresholdToPIC();
+}
+
+// Main loop
+void loop() {
+  server.handleClient();
+  
+  // Handle incoming data from PIC
+  if (PICSerial.available()) {
+    String input = PICSerial.readStringUntil('\n');
+    input.trim();
+    
+    if (input.length() > 0) {
+      Serial.println("Từ PIC: " + input);
+      lastDataSendTime = millis();  // Update connection timestamp
+      
+      // Parse data from PIC
+      if (input.startsWith("Mode:")) {
+        // Parse the complete data string
+        int modeIndex = input.indexOf("Mode:");
+        int rIndex = input.indexOf("R:");
+        int lIndex = input.indexOf("L:");
+        int thrIndex = input.indexOf("THR:");
+        int thlIndex = input.indexOf("THL:");
+        int motorIndex = input.indexOf("Motor:");
+        
+        if (modeIndex != -1 && rIndex != -1 && lIndex != -1 && thrIndex != -1 && thlIndex != -1) {
+          // Parse mode
+          String modeStr = input.substring(modeIndex + 5, input.indexOf(',', modeIndex));
+          mode = (modeStr == "AUTO") ? "AUTO" : "MANUAL";
+          
+          // Parse sensor values
+          String rStr = input.substring(rIndex + 2, input.indexOf(',', rIndex));
+          String lStr = input.substring(lIndex + 2, input.indexOf(',', lIndex));
+          sensorRain = rStr.toInt();
+          sensorLight = lStr.toInt();
+          
+          // Parse thresholds
+          String thrStr = input.substring(thrIndex + 4, input.indexOf(',', thrIndex));
+          String thlStr = input.substring(thlIndex + 4, motorIndex != -1 ? input.indexOf(',', thlIndex) : input.length());
+          receivedThreshold1 = thrStr.toInt();
+          receivedThreshold2 = thlStr.toInt();
+          
+          // Parse motor status
+          if (motorIndex != -1) {
+            String motorStr = input.substring(motorIndex + 6);
+            motorStr.trim();
+            if (motorStr == "FWD" || motorStr == "REV" || motorStr == "STOP") {
+              motorStatus = motorStr;
+            }
+          }
+          
+          Serial.println("Đã parse: Mode=" + mode + ", Rain=" + String(sensorRain) + 
+                         ", Light=" + String(sensorLight) + ", THR=" + String(receivedThreshold1) + 
+                         ", THL=" + String(receivedThreshold2) + ", Motor=" + motorStatus);
+        }
+      }
+      // Handle threshold confirmation
+      else if (input.startsWith("THR=") && input.indexOf("THL=") != -1) {
+        int thrIndex = input.indexOf("THR=");
+        int thlIndex = input.indexOf("THL=");
+        
+        if (thrIndex != -1) {
+          String thrStr = input.substring(thrIndex + 4, input.indexOf(';', thrIndex));
+          receivedThreshold1 = thrStr.toInt();
+        }
+        if (thlIndex != -1) {
+          String thlStr = input.substring(thlIndex + 4);
+          receivedThreshold2 = thlStr.toInt();
+        }
+        Serial.println("Nhận xác nhận ngưỡng từ PIC: THR=" + String(receivedThreshold1) + ", THL=" + String(receivedThreshold2));
+      }
+    }
+  }
+  
+  // Send periodic commands if needed
+  if (millis() - lastCommandTime >= commandInterval) {
+    lastCommandTime = millis();
+    
+    // Send pending threshold updates
+    if (pendingThresholdUpdate) {
+      sendThresholdToPIC();
+    }
+  }
+  
+  delay(50);  // Small delay to prevent overwhelming the system
+}
